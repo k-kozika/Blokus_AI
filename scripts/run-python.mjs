@@ -39,7 +39,7 @@ if (!scriptPath) {
 }
 
 const python = await resolvePython();
-const child = spawn(python, [scriptPath, ...args], {
+const child = spawn("uv", ["run", scriptPath, ...args], {
   cwd: root,
   stdio: "inherit",
   shell: false,
