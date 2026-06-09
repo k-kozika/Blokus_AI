@@ -2,6 +2,7 @@ import { copyFile, createReadStream, createWriteStream } from "node:fs";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, extname, join, resolve } from "node:path";
 import readline from "node:readline";
+import { once } from "node:events";
 import { createGunzip, createGzip } from "node:zlib";
 
 function nowIso() {
@@ -14,14 +15,6 @@ function createSeededRandom(seed) {
     state = (1664525 * state + 1013904223) >>> 0;
     return state / 0x100000000;
   };
-}
-
-function randomShuffle(array, random = Math.random) {
-  for (let index = array.length - 1; index > 0; index -= 1) {
-    const swapIndex = Math.floor(random() * (index + 1));
-    [array[index], array[swapIndex]] = [array[swapIndex], array[index]];
-  }
-  return array;
 }
 
 async function pipelinePromise(source, ...streams) {
@@ -223,12 +216,46 @@ export async function pruneReplayBuffer(bufferDir, options = {}) {
   };
 }
 
-function weightedKeys(entries, random) {
-  return entries.map((entry) => {
-    const weight = Math.max(1e-6, Number(entry.weight ?? 1));
-    const u = Math.max(1e-9, random());
-    return { ...entry, key: Math.pow(u, 1 / weight) };
-  }).sort((a, b) => b.key - a.key);
+function normalizedSampleLimit(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) return Math.max(1, Number(fallback) || 1);
+  return Math.max(1, Math.floor(parsed));
+}
+
+function pushPrioritySample(samples, sample, limit) {
+  if (samples.length < limit) {
+    samples.push(sample);
+    return;
+  }
+  let minIndex = 0;
+  for (let index = 1; index < samples.length; index += 1) {
+    if (samples[index].key < samples[minIndex].key) minIndex = index;
+  }
+  if (sample.key > samples[minIndex].key) samples[minIndex] = sample;
+}
+
+function pushUniformSample(samples, sample, seen, random, limit) {
+  if (samples.length < limit) {
+    samples.push(sample);
+    return;
+  }
+  const replaceIndex = Math.floor(random() * seen);
+  if (replaceIndex < limit) samples[replaceIndex] = sample;
+}
+
+async function writeJsonlLines(path, entries) {
+  await mkdir(dirname(path), { recursive: true });
+  const stream = createWriteStream(path, { encoding: "utf-8" });
+  try {
+    for (const entry of entries) {
+      if (!stream.write(`${entry.line}\n`)) await once(stream, "drain");
+    }
+    stream.end();
+    await once(stream, "finish");
+  } catch (error) {
+    stream.destroy();
+    throw error;
+  }
 }
 
 export async function sampleReplayBufferToDataset(bufferDir, outputPath, options = {}) {
@@ -240,14 +267,15 @@ export async function sampleReplayBufferToDataset(bufferDir, outputPath, options
     throw new Error(`Replay buffer at ${bufferDir} is empty.`);
   }
 
-  const maxSamples = Math.max(1, Number(options.maxSamples ?? context.manifest.activeSampleCount));
+  const maxSamples = normalizedSampleLimit(options.maxSamples ?? context.manifest.activeSampleCount, context.manifest.activeSampleCount);
   const includeShards = options.includeShards ? new Set(options.includeShards) : null;
   const strategy = String(options.strategy ?? "uniform").toLowerCase();
   const seed = Number(options.seed ?? Date.now());
   const rng = createSeededRandom(seed);
 
   const selectedEntries = activeEntries.filter((entry) => !includeShards || includeShards.has(entry.id));
-  const sampled = [];
+  let seen = 0;
+  const picked = [];
   for (const entry of selectedEntries) {
     const rl = readline.createInterface({
       input: createShardReadStream(entry.file),
@@ -256,23 +284,27 @@ export async function sampleReplayBufferToDataset(bufferDir, outputPath, options
     for await (const line of rl) {
       if (!line.trim()) continue;
       const sample = JSON.parse(line);
+      seen += 1;
       const priorityWeight = strategy === "priority"
         ? entry.priority * parseSamplePriority(sample)
         : 1;
-      sampled.push({
+      const candidate = {
         line,
         shardId: entry.id,
         weight: priorityWeight,
-      });
+      };
+      if (strategy === "priority") {
+        const weight = Math.max(1e-6, Number(candidate.weight ?? 1));
+        const u = Math.max(1e-9, rng());
+        pushPrioritySample(picked, { ...candidate, key: Math.pow(u, 1 / weight) }, maxSamples);
+      } else {
+        pushUniformSample(picked, candidate, seen, rng, maxSamples);
+      }
     }
   }
 
-  const picked = strategy === "priority"
-    ? weightedKeys(sampled, rng).slice(0, Math.min(maxSamples, sampled.length))
-    : randomShuffle(sampled, rng).slice(0, Math.min(maxSamples, sampled.length));
-
-  await mkdir(dirname(outputPath), { recursive: true });
-  await writeFile(outputPath, `${picked.map((entry) => entry.line).join("\n")}${picked.length > 0 ? "\n" : ""}`, "utf-8");
+  if (strategy === "priority") picked.sort((a, b) => b.key - a.key);
+  await writeJsonlLines(outputPath, picked);
   const meta = {
     createdAt: nowIso(),
     bufferDir: context.bufferDir,

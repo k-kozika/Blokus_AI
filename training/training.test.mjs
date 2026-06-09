@@ -111,6 +111,34 @@ suite.test("replay buffer can ingest and resample shards", async () => {
   assert.ok(stats.activeSampleCount > 0);
 });
 
+suite.test("replay buffer sampling streams bounded output", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "blokus-replay-stream-"));
+  const datasetPath = join(tempDir, "dataset.jsonl");
+  const replayDir = join(tempDir, "replay");
+  const sampledPath = join(tempDir, "sampled.jsonl");
+  const lines = Array.from({ length: 200 }, (_, index) => JSON.stringify({
+    selected_action: index,
+    legal_actions: [index],
+    final_score_diff: index % 7,
+    sampling_priority: index + 1,
+    payload: "x".repeat(4096),
+  }));
+  await writeFile(datasetPath, `${lines.join("\n")}\n`, "utf-8");
+  await addShardToReplayBuffer(replayDir, datasetPath, { source: "large-test" });
+
+  const sampled = await sampleReplayBufferToDataset(replayDir, sampledPath, {
+    maxSamples: 7,
+    seed: 3,
+    strategy: "priority",
+  });
+  const records = (await readFile(sampledPath, "utf-8")).trim().split("\n").map((line) => JSON.parse(line));
+  const meta = JSON.parse(await readFile(`${sampledPath}.meta.json`, "utf-8"));
+  assert.equal(sampled.sampleCount, 7);
+  assert.equal(records.length, 7);
+  assert.equal(meta.sampleCount, 7);
+  assert.equal(meta.strategy, "priority");
+});
+
 suite.test("replay buffer supports gzip shards and priority sampling", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "blokus-priority-replay-"));
   const replayDir = join(tempDir, "replay");
