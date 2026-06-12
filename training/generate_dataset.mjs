@@ -1,7 +1,10 @@
-import { createWriteStream } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import {
   applyMove,
   createInitialState,
@@ -25,6 +28,8 @@ export function parseArgs(argv) {
     blackModel: null,
     whiteModel: null,
     policyTargetSource: "auto",
+    parallel: 1,
+    workerMode: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -38,6 +43,8 @@ export function parseArgs(argv) {
     if (value === "--black-model") args.blackModel = argv[++index];
     if (value === "--white-model") args.whiteModel = argv[++index];
     if (value === "--policy-target-source") args.policyTargetSource = argv[++index];
+    if (value === "--parallel") args.parallel = Math.max(1, Number(argv[++index]));
+    if (value === "--worker-mode") args.workerMode = true;
   }
 
   return args;
@@ -151,7 +158,110 @@ export async function generateDataset(config) {
 
 async function main() {
   const config = parseArgs(process.argv.slice(2));
-  await generateDataset(config);
+  if (config.parallel > 1 && !config.workerMode) {
+    await generateDatasetParallel(config);
+  } else {
+    await generateDataset(config);
+  }
+}
+
+function splitGames(totalGames, workers) {
+  const actualWorkers = Math.max(1, Math.min(workers, totalGames));
+  const base = Math.floor(totalGames / actualWorkers);
+  const remainder = totalGames % actualWorkers;
+  return Array.from({ length: actualWorkers }, (_, index) => base + (index < remainder ? 1 : 0))
+    .filter((games) => games > 0);
+}
+
+function runDatasetWorker(config, games, out) {
+  const args = [
+    fileURLToPath(import.meta.url),
+    "--games", String(games),
+    "--out", out,
+    "--teacher-ms", String(config.teacherMs),
+    "--start-policy", config.startPolicy,
+    "--black-ai", config.blackAi,
+    "--white-ai", config.whiteAi,
+    "--policy-target-source", config.policyTargetSource,
+    "--worker-mode",
+    ...(config.blackModel ? ["--black-model", config.blackModel] : []),
+    ...(config.whiteModel ? ["--white-model", config.whiteModel] : []),
+  ];
+
+  return new Promise((resolve, reject) => {
+    const child = spawn("node", args, {
+      cwd: root,
+      stdio: "inherit",
+      shell: false,
+      env: {
+        ...process.env,
+        BLOKUS_ORT_THREADS: process.env.BLOKUS_ORT_THREADS ?? "1",
+      },
+    });
+    child.on("exit", (code) => {
+      if ((code ?? 1) === 0) resolve();
+      else reject(new Error(`dataset worker exited with ${code}`));
+    });
+  });
+}
+
+async function appendFileToStream(path, stream) {
+  await pipeline(createReadStream(path, { encoding: "utf-8" }), stream, { end: false });
+}
+
+export async function generateDatasetParallel(config) {
+  const tempDir = await mkdtemp(join(tmpdir(), "blokus-dataset-"));
+  const chunks = splitGames(config.games, config.parallel);
+  await mkdir(dirname(config.out), { recursive: true });
+
+  try {
+    const shardPaths = chunks.map((_, index) => join(tempDir, `dataset-${String(index + 1).padStart(3, "0")}.jsonl`));
+    await Promise.all(chunks.map((games, index) => runDatasetWorker(config, games, shardPaths[index])));
+
+    let totalPositions = 0;
+    const output = createWriteStream(config.out, { encoding: "utf-8" });
+    try {
+      for (const shardPath of shardPaths) {
+        const meta = JSON.parse(await readFile(`${shardPath}.meta.json`, "utf-8"));
+        totalPositions += meta.totalPositions ?? 0;
+        await appendFileToStream(shardPath, output);
+      }
+    } finally {
+      await new Promise((resolve, reject) => {
+        output.end((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+    }
+
+    await writeFile(
+      `${config.out}.meta.json`,
+      `${JSON.stringify({
+        games: config.games,
+        totalPositions,
+        blackAi: config.blackAi ?? "expert",
+        whiteAi: config.whiteAi ?? "expert",
+        blackModel: config.blackModel ?? null,
+        whiteModel: config.whiteModel ?? null,
+        policyTargetSource: config.policyTargetSource ?? "auto",
+        teacherMs: config.teacherMs,
+        startPolicy: config.startPolicy,
+        parallel: config.parallel,
+      }, null, 2)}\n`,
+    );
+
+    console.log(`Saved ${totalPositions} samples to ${config.out} using ${chunks.length} workers`);
+    return {
+      games: config.games,
+      totalPositions,
+      out: config.out,
+      metaPath: `${config.out}.meta.json`,
+      parallel: config.parallel,
+    };
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

@@ -69,7 +69,7 @@ export async function playToEndFromState(state, config = {}) {
   const replaySpec = {
     difficulty: config.teacher ?? config.difficulty ?? "expert",
     timeLimitMs: config.teacherMs ?? 25,
-    modelPath: config.modelPath ?? null,
+    modelPath: config.teacherModel ?? config.modelPath ?? null,
     epsilon: config.epsilon ?? 0.08,
   };
 

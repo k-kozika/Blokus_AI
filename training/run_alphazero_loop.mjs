@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { runArena } from "./arena_runtime.mjs";
+import { runParallelArena } from "./run_arena.mjs";
 import { eloGateDecision } from "./elo.mjs";
 import { ensureModelRegistry, getActiveModel, promoteModel, registerModel } from "./model_registry.mjs";
 import { runDistributedSelfPlay } from "./run_distributed_selfplay.mjs";
@@ -23,6 +24,9 @@ function parseArgs(argv) {
     batchSize: 2048,
     cpu: false,
     evaluationGames: 6,
+    arenaParallel: 1,
+    evaluationOpponent: null,
+    evaluationOpponentModel: null,
     candidateMs: 300,
     baselineMs: 300,
     minWinRate: 0.55,
@@ -58,6 +62,9 @@ function parseArgs(argv) {
       }
     }
     if (value === "--evaluation-games") args.evaluationGames = Number(argv[++index]);
+    if (value === "--arena-parallel") args.arenaParallel = Math.max(1, Number(argv[++index]));
+    if (value === "--evaluation-opponent") args.evaluationOpponent = argv[++index];
+    if (value === "--evaluation-opponent-model") args.evaluationOpponentModel = argv[++index];
     if (value === "--candidate-ms") args.candidateMs = Number(argv[++index]);
     if (value === "--baseline-ms") args.baselineMs = Number(argv[++index]);
     if (value === "--min-win-rate") args.minWinRate = Number(argv[++index]);
@@ -169,34 +176,55 @@ async function runIteration(config, iterationIndex) {
     candidatePath,
   ]);
 
-  const opponentDifficulty = activeModelPath ? "master" : "expert";
-  const arena = await runArena({
+  const opponentDifficulty = config.evaluationOpponent ?? (activeModelPath ? "master" : "expert");
+  const opponentModelPath = config.evaluationOpponent
+    ? (config.evaluationOpponentModel ?? null)
+    : activeModelPath;
+  const opponentName = config.evaluationOpponent ?? (activeModel ? activeModel.id : opponentDifficulty);
+  const arenaArgs = {
     games: config.evaluationGames,
+    parallel: config.arenaParallel,
     startPolicy: config.startPolicy,
     swapColors: true,
-    alpha: {
-      name: "candidate",
-      spec: {
-        difficulty: "master",
-        modelPath: candidatePath,
-        timeLimitMs: config.candidateMs,
+    alphaAi: "master",
+    alphaName: "candidate",
+    alphaModel: candidatePath,
+    alphaMs: config.candidateMs,
+    betaAi: opponentDifficulty,
+    betaName: opponentName,
+    betaModel: opponentModelPath,
+    betaMs: config.baselineMs,
+  };
+  const arena = config.arenaParallel > 1
+    ? await runParallelArena(arenaArgs)
+    : await runArena({
+      games: config.evaluationGames,
+      startPolicy: config.startPolicy,
+      swapColors: true,
+      alpha: {
+        name: "candidate",
+        spec: {
+          difficulty: "master",
+          modelPath: candidatePath,
+          timeLimitMs: config.candidateMs,
+        },
       },
-    },
-    beta: {
-      name: activeModel ? activeModel.id : opponentDifficulty,
-      spec: {
-        difficulty: opponentDifficulty,
-        modelPath: activeModelPath,
-        timeLimitMs: config.baselineMs,
+      beta: {
+        name: opponentName,
+        spec: {
+          difficulty: opponentDifficulty,
+          modelPath: opponentModelPath,
+          timeLimitMs: config.baselineMs,
+        },
       },
-    },
-  });
+    });
   await writeFile(arenaSummaryPath, `${JSON.stringify(arena, null, 2)}\n`, "utf-8");
 
   const candidate = arena.contestants.candidate;
   const winRate = candidate.wins / Math.max(1, config.evaluationGames);
-  const baselineName = activeModel ? activeModel.id : opponentDifficulty;
-  const eloDecision = activeModel
+  const baselineName = opponentName;
+  const useActiveBestEloGate = activeModel && !config.evaluationOpponent;
+  const eloDecision = useActiveBestEloGate
     ? eloGateDecision({
       arena,
       candidateName: "candidate",
@@ -207,7 +235,7 @@ async function runIteration(config, iterationIndex) {
       minLowerBoundGain: config.minEloLowerBoundGain,
     })
     : null;
-  const promote = activeModel
+  const promote = useActiveBestEloGate
     ? eloDecision.promote
     : (winRate >= config.minWinRate && candidate.averageMargin >= config.minAverageMargin);
 
@@ -221,6 +249,9 @@ async function runIteration(config, iterationIndex) {
       winRate,
       averageMargin: candidate.averageMargin,
       evaluationGames: config.evaluationGames,
+      arenaParallel: config.arenaParallel,
+      evaluationOpponent: opponentDifficulty,
+      evaluationOpponentModel: opponentModelPath,
       eloDecision,
     },
     arenaSummaryPath,
@@ -268,6 +299,11 @@ async function runIteration(config, iterationIndex) {
     iteration: iterationIndex + 1,
     activeBaselineModelId: activeModel?.id ?? null,
     activeBaselineModelPath: activeModelPath,
+    evaluationOpponent: {
+      name: opponentName,
+      difficulty: opponentDifficulty,
+      modelPath: opponentModelPath,
+    },
     selfPlaySummary,
     sampledReplay: sampled,
     trainingSummary,

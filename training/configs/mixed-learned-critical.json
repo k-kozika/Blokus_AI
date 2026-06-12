@@ -1,0 +1,7 @@
+{
+  "datasets": [
+    { "path": "../data/expert-10k.jsonl", "weight": 0.5 },
+    { "path": "../data/learned-selfplay-50k.jsonl", "weight": 0.3 },
+    { "path": "../dataset/critical_replay/learned-master-10k/records.jsonl", "weight": 0.2 }
+  ]
+}

@@ -66,6 +66,7 @@ export async function playArenaGame(config = {}) {
 
 export async function runArena(config = {}) {
   const games = Math.max(1, Number(config.games ?? 2));
+  const indexOffset = Math.max(0, Number(config.indexOffset ?? 0));
   const swapColors = config.swapColors !== false;
   const alphaName = config.alpha?.name ?? "alpha";
   const betaName = config.beta?.name ?? "beta";
@@ -78,7 +79,8 @@ export async function runArena(config = {}) {
   };
 
   for (let gameIndex = 0; gameIndex < games; gameIndex += 1) {
-    const swapped = swapColors && gameIndex % 2 === 1;
+    const absoluteGameIndex = indexOffset + gameIndex;
+    const swapped = swapColors && absoluteGameIndex % 2 === 1;
     const seats = swapped
       ? {
         black: { name: betaName, spec: betaSpec },
@@ -113,7 +115,7 @@ export async function runArena(config = {}) {
     }
 
     results.push({
-      index: gameIndex,
+      index: absoluteGameIndex,
       black: game.black,
       white: game.white,
       scores: game.scores,

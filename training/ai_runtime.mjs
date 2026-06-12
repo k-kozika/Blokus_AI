@@ -10,6 +10,11 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const defaultModelPath = join(root, "apps", "web", "public", "models", "blokus_policy.onnx");
 const sessionCache = new Map();
 
+const configuredOrtThreads = Number(process.env.BLOKUS_ORT_THREADS ?? 0);
+if (Number.isInteger(configuredOrtThreads) && configuredOrtThreads > 0 && ort.env?.wasm) {
+  ort.env.wasm.numThreads = configuredOrtThreads;
+}
+
 export const TRAINING_AI_DIFFICULTIES = ["easy", "normal", "hard", "expert", "expert_plus", "learned", "master"];
 
 function normalizeDifficulty(value) {

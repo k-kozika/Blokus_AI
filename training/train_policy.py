@@ -47,8 +47,12 @@ class PolicyDataset(Dataset):
         )
 
 
+def mask_illegal_logits(logits, legal_mask):
+    return logits.float().masked_fill(legal_mask <= 0, -1e9)
+
+
 def masked_cross_entropy(logits, legal_mask, target):
-    masked_logits = logits.masked_fill(legal_mask <= 0, -1e9)
+    masked_logits = mask_illegal_logits(logits, legal_mask)
     return nn.functional.cross_entropy(masked_logits, target)
 
 
@@ -71,7 +75,7 @@ def evaluate(model, loader, device, amp_enabled):
                 logits = model(states)
                 loss = masked_cross_entropy(logits, masks, targets)
             losses.append(float(loss.item()))
-            predictions = logits.masked_fill(masks <= 0, -1e9).argmax(dim=1)
+            predictions = mask_illegal_logits(logits, masks).argmax(dim=1)
             correct += int((predictions == targets).sum().item())
             total += int(targets.numel())
     return {

@@ -121,6 +121,41 @@ npm run typecheck
 
 現在は外部 linter / TypeScript compiler を導入していないため、上記は確認用の no-op script です。
 
+## Training Environment Quick Start
+
+学習・GPU・Critical Replay の実行手順は `TRAINING_RUNBOOK.md` にまとめています。
+学習関連 CLI の具体的な全オプションは `TRAINING_OPTIONS.md` にまとめています。
+
+まず環境を確認する場合:
+
+```bash
+npm run python:check
+```
+
+CUDA 対応 PyTorch を入れる場合:
+
+```bash
+npm run python:install:gpu
+```
+
+最小の学習 smoke:
+
+```bash
+npm run smoke:learning
+```
+
+Critical Replay の最小 smoke:
+
+```bash
+npm run smoke:critical
+```
+
+学習コマンドのオプションを確認する場合:
+
+```text
+TRAINING_OPTIONS.md
+```
+
 ## GitHub Pages Deploy
 
 `.github/workflows/deploy.yml` が `main` branch への push で実行されます。

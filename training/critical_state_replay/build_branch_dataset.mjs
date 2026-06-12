@@ -1,8 +1,11 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
+import { spawn } from "node:child_process";
 import {
   CRITICAL_REPLAY_SCHEMA_VERSION,
   phaseForState,
@@ -22,9 +25,12 @@ export function parseBranchArgs(argv) {
     topKActions: 8,
     playoutsPerAction: 2,
     teacher: "expert",
+    teacherModel: null,
     teacherMs: 25,
     temperature: 0.7,
     epsilon: 0.08,
+    parallel: 1,
+    workerMode: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -35,9 +41,12 @@ export function parseBranchArgs(argv) {
     if (value === "--top-k-actions") args.topKActions = Number(argv[++index]);
     if (value === "--playouts-per-action") args.playoutsPerAction = Number(argv[++index]);
     if (value === "--teacher") args.teacher = argv[++index];
+    if (value === "--teacher-model") args.teacherModel = argv[++index];
     if (value === "--teacher-ms") args.teacherMs = Number(argv[++index]);
     if (value === "--temperature") args.temperature = Number(argv[++index]);
     if (value === "--epsilon") args.epsilon = Number(argv[++index]);
+    if (value === "--parallel") args.parallel = Math.max(1, Number(argv[++index]));
+    if (value === "--worker-mode") args.workerMode = true;
   }
 
   return args;
@@ -146,6 +155,7 @@ export async function buildBranchDataset(config = {}) {
     topKActions: config.topKActions,
     playoutsPerAction: config.playoutsPerAction,
     teacher: config.teacher,
+    teacherModel: config.teacherModel ?? null,
     teacherMs: config.teacherMs,
   };
   await writeFile(join(outDir, "metadata.json"), `${JSON.stringify(summary, null, 2)}\n`, "utf-8");
@@ -154,7 +164,122 @@ export async function buildBranchDataset(config = {}) {
 
 async function main() {
   const config = parseBranchArgs(process.argv.slice(2));
-  await buildBranchDataset(config);
+  if (config.parallel > 1 && !config.workerMode) {
+    await buildBranchDatasetParallel(config);
+  } else {
+    await buildBranchDataset(config);
+  }
+}
+
+function splitArray(items, workers) {
+  const actualWorkers = Math.max(1, Math.min(workers, items.length));
+  const chunks = Array.from({ length: actualWorkers }, () => []);
+  for (let index = 0; index < items.length; index += 1) {
+    chunks[index % actualWorkers].push(items[index]);
+  }
+  return chunks.filter((chunk) => chunk.length > 0);
+}
+
+function runCriticalReplayWorker(config, trajectoriesPath, outDir) {
+  const args = [
+    fileURLToPath(import.meta.url),
+    "--trajectories", trajectoriesPath,
+    "--out", outDir,
+    "--critical-states-per-game", String(config.criticalStatesPerGame),
+    "--top-k-actions", String(config.topKActions),
+    "--playouts-per-action", String(config.playoutsPerAction),
+    "--teacher", config.teacher,
+    "--teacher-ms", String(config.teacherMs),
+    "--temperature", String(config.temperature),
+    "--epsilon", String(config.epsilon),
+    "--worker-mode",
+    ...(config.teacherModel ? ["--teacher-model", config.teacherModel] : []),
+  ];
+
+  return new Promise((resolveWorker, reject) => {
+    const child = spawn("node", args, {
+      cwd: root,
+      stdio: "inherit",
+      shell: false,
+      env: {
+        ...process.env,
+        BLOKUS_ORT_THREADS: process.env.BLOKUS_ORT_THREADS ?? "1",
+      },
+    });
+    child.on("exit", (code) => {
+      if ((code ?? 1) === 0) resolveWorker();
+      else reject(new Error(`critical replay worker exited with ${code}`));
+    });
+  });
+}
+
+async function appendFileToStream(path, stream) {
+  await pipeline(createReadStream(path, { encoding: "utf-8" }), stream, { end: false });
+}
+
+export async function buildBranchDatasetParallel(config) {
+  const trajectories = await readTrajectories(config.trajectories);
+  const outDir = resolve(config.out);
+  const tempDir = await mkdtemp(join(tmpdir(), "blokus-critical-replay-"));
+  const chunks = splitArray(trajectories, config.parallel);
+  await mkdir(outDir, { recursive: true });
+
+  try {
+    const workerSpecs = [];
+    for (let index = 0; index < chunks.length; index += 1) {
+      const workerDir = join(tempDir, `worker-${String(index + 1).padStart(3, "0")}`);
+      await mkdir(workerDir, { recursive: true });
+      const trajectoriesPath = join(workerDir, "trajectories.jsonl");
+      await writeFile(
+        trajectoriesPath,
+        chunks[index].map((trajectory) => JSON.stringify(trajectory)).join("\n") + "\n",
+        "utf-8",
+      );
+      workerSpecs.push({
+        trajectoriesPath,
+        outDir: join(workerDir, "critical_replay"),
+      });
+    }
+
+    await Promise.all(workerSpecs.map((spec) => runCriticalReplayWorker(config, spec.trajectoriesPath, spec.outDir)));
+
+    let criticalStates = 0;
+    let records = 0;
+    const recordsPath = join(outDir, "records.jsonl");
+    const output = createWriteStream(recordsPath, { encoding: "utf-8" });
+    try {
+      for (const spec of workerSpecs) {
+        const meta = JSON.parse(await readFile(join(spec.outDir, "metadata.json"), "utf-8"));
+        criticalStates += meta.criticalStates ?? 0;
+        records += meta.records ?? 0;
+        await appendFileToStream(join(spec.outDir, "records.jsonl"), output);
+      }
+    } finally {
+      await new Promise((resolveEnd, reject) => {
+        output.end((error) => {
+          if (error) reject(error);
+          else resolveEnd();
+        });
+      });
+    }
+
+    const summary = {
+      trajectories: trajectories.length,
+      criticalStates,
+      records,
+      recordsPath,
+      topKActions: config.topKActions,
+      playoutsPerAction: config.playoutsPerAction,
+      teacher: config.teacher,
+      teacherModel: config.teacherModel ?? null,
+      teacherMs: config.teacherMs,
+      parallel: config.parallel,
+    };
+    await writeFile(join(outDir, "metadata.json"), `${JSON.stringify(summary, null, 2)}\n`, "utf-8");
+    return summary;
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

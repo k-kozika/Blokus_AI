@@ -148,8 +148,12 @@ def weighted_mean(values, sample_weight):
     return (values * sample_weight).sum() / sample_weight.sum().clamp_min(1e-8)
 
 
+def mask_illegal_logits(logits, legal_mask):
+    return logits.float().masked_fill(legal_mask <= 0, -1e9)
+
+
 def masked_policy_loss(logits, legal_mask, target_distribution, target_action, sample_weight=None):
-    masked_logits = logits.masked_fill(legal_mask <= 0, -1e9)
+    masked_logits = mask_illegal_logits(logits, legal_mask)
     if target_distribution is not None:
         normalized = target_distribution * legal_mask
         denom = normalized.sum(dim=1, keepdim=True).clamp_min(1e-8)
@@ -197,7 +201,7 @@ def evaluate(model, loader, device, amp_enabled, value_weight):
         losses.append(float(loss.item()))
         policy_losses.append(float(policy_loss.item()))
         value_losses.append(float(value_loss.item()))
-        predictions = logits.masked_fill(masks <= 0, -1e9).argmax(dim=1)
+        predictions = mask_illegal_logits(logits, masks).argmax(dim=1)
         correct += int((predictions == targets).sum().item())
         total += int(targets.numel())
         mae_sum += float(torch.abs(values - value_targets).sum().item())

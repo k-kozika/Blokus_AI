@@ -1,7 +1,10 @@
-import { createWriteStream } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import {
   applyMove,
   cloneState,
@@ -66,6 +69,9 @@ export function parseTrajectoryArgs(argv) {
     whiteAi: "expert",
     blackModel: null,
     whiteModel: null,
+    parallel: 1,
+    indexOffset: 0,
+    workerMode: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -82,6 +88,9 @@ export function parseTrajectoryArgs(argv) {
     if (value === "--white-ai") args.whiteAi = argv[++index];
     if (value === "--black-model") args.blackModel = argv[++index];
     if (value === "--white-model") args.whiteModel = argv[++index];
+    if (value === "--parallel") args.parallel = Math.max(1, Number(argv[++index]));
+    if (value === "--index-offset") args.indexOffset = Math.max(0, Number(argv[++index]));
+    if (value === "--worker-mode") args.workerMode = true;
   }
 
   return args;
@@ -155,16 +164,17 @@ export async function generateTrajectories(config = {}) {
     for (let gameIndex = 0; gameIndex < config.games; gameIndex += 1) {
       const game = await collectTrajectoryGame(config);
       totalSteps += game.steps.length;
+      const absoluteGameIndex = (config.indexOffset ?? 0) + gameIndex;
       const record = {
         schema_version: 1,
-        game_id: `game-${String(gameIndex).padStart(6, "0")}`,
+        game_id: `game-${String(absoluteGameIndex).padStart(6, "0")}`,
         score: game.score,
         steps: game.steps,
       };
       if (!stream.write(`${JSON.stringify(record)}\n`)) {
         await new Promise((resolveDrain) => stream.once("drain", resolveDrain));
       }
-      console.log(`Trajectory ${gameIndex + 1}/${config.games}: ${game.steps.length} steps, score ${game.score[0]}-${game.score[1]}`);
+      console.log(`Trajectory ${absoluteGameIndex + 1}: ${game.steps.length} steps, score ${game.score[0]}-${game.score[1]}`);
     }
   } finally {
     await new Promise((resolveEnd, reject) => {
@@ -183,6 +193,8 @@ export async function generateTrajectories(config = {}) {
     whiteAi: config.whiteAi,
     teacherMs: config.teacherMs,
     startPolicy: config.startPolicy,
+    parallel: config.parallel ?? 1,
+    indexOffset: config.indexOffset ?? 0,
   };
   await writeFile(join(outDir, "metadata.json"), `${JSON.stringify(summary, null, 2)}\n`, "utf-8");
   return summary;
@@ -190,7 +202,106 @@ export async function generateTrajectories(config = {}) {
 
 async function main() {
   const config = parseTrajectoryArgs(process.argv.slice(2));
-  await generateTrajectories(config);
+  if (config.parallel > 1 && !config.workerMode) {
+    await generateTrajectoriesParallel(config);
+  } else {
+    await generateTrajectories(config);
+  }
+}
+
+function splitGames(totalGames, workers) {
+  const actualWorkers = Math.max(1, Math.min(workers, totalGames));
+  const base = Math.floor(totalGames / actualWorkers);
+  const remainder = totalGames % actualWorkers;
+  const chunks = [];
+  let offset = 0;
+  for (let index = 0; index < actualWorkers; index += 1) {
+    const games = base + (index < remainder ? 1 : 0);
+    chunks.push({ games, offset });
+    offset += games;
+  }
+  return chunks;
+}
+
+function runTrajectoryWorker(config, chunk, outDir) {
+  const args = [
+    fileURLToPath(import.meta.url),
+    "--games", String(chunk.games),
+    "--index-offset", String(chunk.offset),
+    "--out", outDir,
+    "--teacher-ms", String(config.teacherMs),
+    "--start-policy", config.startPolicy,
+    "--black-ai", config.blackAi,
+    "--white-ai", config.whiteAi,
+    "--worker-mode",
+    ...(config.blackModel ? ["--black-model", config.blackModel] : []),
+    ...(config.whiteModel ? ["--white-model", config.whiteModel] : []),
+  ];
+
+  return new Promise((resolveWorker, reject) => {
+    const child = spawn("node", args, {
+      cwd: root,
+      stdio: "inherit",
+      shell: false,
+      env: {
+        ...process.env,
+        BLOKUS_ORT_THREADS: process.env.BLOKUS_ORT_THREADS ?? "1",
+      },
+    });
+    child.on("exit", (code) => {
+      if ((code ?? 1) === 0) resolveWorker();
+      else reject(new Error(`trajectory worker exited with ${code}`));
+    });
+  });
+}
+
+async function appendFileToStream(path, stream) {
+  await pipeline(createReadStream(path, { encoding: "utf-8" }), stream, { end: false });
+}
+
+export async function generateTrajectoriesParallel(config) {
+  const tempDir = await mkdtemp(join(tmpdir(), "blokus-trajectories-"));
+  const outDir = resolve(config.out);
+  const chunks = splitGames(config.games, config.parallel);
+  await mkdir(outDir, { recursive: true });
+
+  try {
+    const shardDirs = chunks.map((_, index) => join(tempDir, `worker-${String(index + 1).padStart(3, "0")}`));
+    await Promise.all(chunks.map((chunk, index) => runTrajectoryWorker(config, chunk, shardDirs[index])));
+
+    let totalSteps = 0;
+    const trajectoryPath = join(outDir, "trajectories.jsonl");
+    const output = createWriteStream(trajectoryPath, { encoding: "utf-8" });
+    try {
+      for (const shardDir of shardDirs) {
+        const meta = JSON.parse(await readFile(join(shardDir, "metadata.json"), "utf-8"));
+        totalSteps += meta.totalSteps ?? 0;
+        await appendFileToStream(join(shardDir, "trajectories.jsonl"), output);
+      }
+    } finally {
+      await new Promise((resolveEnd, reject) => {
+        output.end((error) => {
+          if (error) reject(error);
+          else resolveEnd();
+        });
+      });
+    }
+
+    const summary = {
+      games: config.games,
+      totalSteps,
+      trajectoryPath,
+      blackAi: config.blackAi,
+      whiteAi: config.whiteAi,
+      teacherMs: config.teacherMs,
+      startPolicy: config.startPolicy,
+      parallel: config.parallel,
+    };
+    await writeFile(join(outDir, "metadata.json"), `${JSON.stringify(summary, null, 2)}\n`, "utf-8");
+    return summary;
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

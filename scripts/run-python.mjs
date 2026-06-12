@@ -19,10 +19,13 @@ async function resolvePython() {
   const candidates = [
     process.env.BLOKUS_PYTHON,
     process.platform === "win32"
-      ? join(process.env.USERPROFILE || "", ".cache", "codex-runtimes", "codex-primary-runtime", "dependencies", "python", "python.exe")
-      : null,
+      ? join(root, ".venv", "Scripts", "python.exe")
+      : join(root, ".venv", "bin", "python"),
     "python",
     "python3",
+    process.platform === "win32"
+      ? join(process.env.USERPROFILE || "", ".cache", "codex-runtimes", "codex-primary-runtime", "dependencies", "python", "python.exe")
+      : null,
   ].filter(Boolean);
 
   for (const candidate of candidates) {
