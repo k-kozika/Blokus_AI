@@ -42,6 +42,7 @@ function parseArgs(argv) {
     startPolicy: "fixedStart",
     replaySampleStrategy: "priority",
     shardCompression: "gzip",
+    selfplayBackend: "node",
   };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
@@ -88,6 +89,7 @@ function parseArgs(argv) {
     if (value === "--start-policy") args.startPolicy = argv[++index];
     if (value === "--replay-sample-strategy") args.replaySampleStrategy = argv[++index];
     if (value === "--shard-compression") args.shardCompression = argv[++index];
+    if (value === "--selfplay-backend") args.selfplayBackend = argv[++index];
   }
   return args;
 }
@@ -143,6 +145,7 @@ async function runIteration(config, iterationIndex) {
     startPolicy: config.startPolicy,
     policyTargetSource: "visit",
     shardCompression: config.shardCompression,
+    selfplayBackend: config.selfplayBackend,
   });
 
   const sampled = await sampleReplayBufferToDataset(config.replayBufferDir, datasetPath, {

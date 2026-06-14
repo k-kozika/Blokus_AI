@@ -1,0 +1,18 @@
+[package]
+name = "blokus_burn_rs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["flex"]
+flex = ["burn/flex"]
+cuda = ["burn/cuda"]
+
+[dependencies]
+blokus_core_rs = { path = "../blokus_core_rs" }
+burn = { version = "0.21.0", default-features = false, features = ["std", "autodiff", "store"] }
+bincode = { version = "2.0", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

@@ -1,0 +1,12 @@
+[workspace]
+members = [
+  "crates/blokus_core_rs",
+  "crates/blokus_burn_rs",
+  "crates/blokus_train_rs",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "UNLICENSED"
+publish = false

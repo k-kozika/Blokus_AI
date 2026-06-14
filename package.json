@@ -16,9 +16,16 @@
     "gpu:check": "node scripts/check-python-env.mjs",
     "smoke:learning": "node scripts/run-training-preset.mjs smoke:learning",
     "smoke:critical": "node scripts/run-training-preset.mjs smoke:critical",
+    "build:rust": "cargo build --release -p blokus_train_rs",
+    "build:burn": "cargo build --release -p blokus_burn_rs",
     "generate:orientations": "node scripts/generate-orientations.mjs",
     "sync:ort": "node scripts/sync-onnxruntime-assets.mjs",
     "generate:dataset": "node training/generate_dataset.mjs",
+    "generate:dataset:rust": "cargo run --release -p blokus_train_rs --",
+    "burn:selfplay": "cargo run --release -p blokus_burn_rs -- selfplay",
+    "burn:train": "cargo run --release -p blokus_burn_rs -- train",
+    "burn:infer-smoke": "cargo run --release -p blokus_burn_rs -- infer-smoke",
+    "burn:export-weights": "cargo run --release -p blokus_burn_rs -- export-weights",
     "generate:trajectory": "node training/critical_state_replay/collect_trajectory.mjs",
     "generate:critical-replay": "node training/critical_state_replay/build_branch_dataset.mjs",
     "arena:ai": "node training/run_arena.mjs",
@@ -28,11 +35,14 @@
     "agent:selfplay": "node training/run_selfplay_agent.mjs",
     "selfplay:loop": "node training/run_selfplay_loop.mjs",
     "alphazero:loop": "node training/run_alphazero_loop.mjs",
+    "alphazero:burn-loop": "node training/run_burn_alphazero_loop.mjs",
+    "alphazero:loop:rust": "node training/run_burn_alphazero_loop.mjs",
     "registry:model": "node training/model_registry_cli.mjs",
     "train:policy": "node scripts/run-python.mjs training/train_policy.py",
     "train:policy-value": "node scripts/run-python.mjs training/train_policy_value.py",
     "export:onnx": "node scripts/run-python.mjs training/export_onnx.py",
-    "export:onnx:pv": "node scripts/run-python.mjs training/export_onnx.py --model-kind policy_value"
+    "export:onnx:pv": "node scripts/run-python.mjs training/export_onnx.py --model-kind policy_value",
+    "export:onnx:burn": "node scripts/run-python.mjs training/export_burn_onnx.py"
   },
   "dependencies": {
     "onnxruntime-web": "^1.26.0"

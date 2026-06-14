@@ -441,6 +441,85 @@ npm run agent:selfplay -- --queue-dir training/distributed_queue --host-id host-
 
 coordinator が pending job を積み、各 host の agent が claim して self-play shard を生成し、replay buffer に gzip で取り込みます。
 
+## Rust Training Backend
+
+AlphaZero loop の self-play 部分を高速化するため、Rust 実装の実験的 backend を追加しています。
+
+Rust binary の build:
+
+```bash
+pnpm run build:rust
+```
+
+Rust backend 単体で dataset を生成:
+
+```bash
+pnpm run generate:dataset:rust -- --games 100 --out training/data/rust-fast-100.jsonl --start-policy fixedStart
+```
+
+AlphaZero loop の self-play に Rust backend を使う場合:
+
+```bash
+pnpm run alphazero:loop -- --iterations 1 --workers 8 --games 800 --sample-size 100000 --epochs 8 --batch-size 2048 --evaluation-games 80 --selfplay-backend rust-fast
+```
+
+現時点の `rust-fast` は、既存 JSONL schema と replay buffer 互換を優先した高速 heuristic self-play backend です。policy-value neural MCTS と Burn 学習器への移行計画は `ALPHAZERO_RUST_MIGRATION_PLAN.md` にあります。
+
+### Burn Policy-Value / PUCT Backend
+
+JSONL 互換を捨てて高速化する Rust-native 経路として、Burn の policy-value model と Rust PUCT self-play を追加しています。Burn は学習・自己対戦高速化用の内部 backend で、Web 側は引き続き `onnxruntime-web` と `apps/web/public/models/blokus_policy_value.onnx` だけを読みます。
+
+モデル構造は Python 版 `PolicyValueNet` に合わせて、`51 x 14 x 14` 入力、conv stem、4 residual block、policy head、pass head、value head を使います。
+
+binary replay 生成:
+
+```bash
+pnpm run burn:selfplay -- --games 100 --out training/replay_buffer_rs/replay.bin --simulations 128 --candidate-limit 96 --channels 64 --start-policy fixedStart
+```
+
+Burn 学習:
+
+```bash
+pnpm run burn:train -- --replay training/replay_buffer_rs/replay.bin --output-dir training/checkpoints/burn-policy-value --epochs 8 --batch-size 2048 --channels 64 --lr 0.0003
+```
+
+保存モデルで inference smoke:
+
+```bash
+pnpm run burn:infer-smoke -- --model training/checkpoints/burn-policy-value/model.bin --channels 64
+```
+
+Vast など NVIDIA CUDA 環境では、直接 Cargo feature を指定します。
+
+```bash
+cargo run --release -p blokus_burn_rs --features cuda -- selfplay --games 800 --out training/replay_buffer_rs/replay.bin --simulations 256 --candidate-limit 120 --channels 64
+cargo run --release -p blokus_burn_rs --features cuda -- train --replay training/replay_buffer_rs/replay.bin --output-dir training/checkpoints/burn-policy-value --epochs 8 --batch-size 2048 --channels 64
+```
+
+この経路の replay は `training/replay_buffer_rs/*.bin` の独自 binary format です。既存 JSONL replay buffer との互換性は前提にしていません。
+
+貼り付け済みの AlphaZero loop 引数をそのまま使う場合は、Rust/Burn 専用 script を使います。Linux で `nvidia-smi` が見える環境では自動で Burn CUDA feature を有効化します。
+
+```bash
+pnpm run alphazero:loop:rust -- --iterations 20 --workers 8 --games 800 --teacher-ms 5000 --sample-size 100000 --epochs 8 --batch-size 2048 --evaluation-games 80 --candidate-ms 5000 --baseline-ms 5000 --max-buffer-shards 512 --max-buffer-samples 1000000 --replay-sample-strategy priority --start-policy fixedStart --min-elo-lower-bound-gain 0 --publish-best
+```
+
+追加で調整できる Rust/Burn 固有オプション:
+
+- `--channels`: policy-value net の trunk channel 数。既定は Python 版と同じ `64`
+- `--mcts-simulations`: 1 手あたりの MCTS simulation 上限。既定は `256`
+- `--candidate-limit`: neural prior で展開する候補手上限。既定は `120`
+- `--cuda true|false`: CUDA feature の自動判定を上書き
+
+`--publish-best` を付けると、Burn の best checkpoint を `training/models/best_burn_policy_value.bin` に保存したうえで、PyTorch 互換 weight JSON を経由して Web 用 ONNX を `apps/web/public/models/blokus_policy_value.onnx` に出力します。Web 側の実装は ONNX のままです。
+
+Burn checkpoint から手動で ONNX を作る場合:
+
+```bash
+pnpm run burn:export-weights -- --model training/models/best_burn_policy_value.bin --out training/models/best_burn_policy_value.weights.json --channels 64
+pnpm run export:onnx:burn -- --weights-json training/models/best_burn_policy_value.weights.json --out apps/web/public/models/blokus_policy_value.onnx --channels 64
+```
+
 ## Model Registry
 
 best model の登録と昇格は registry で管理します。

@@ -1,4 +1,5 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
@@ -20,6 +21,7 @@ function parseArgs(argv) {
     startPolicy: "fixedStart",
     policyTargetSource: "visit",
     shardCompression: "gzip",
+    selfplayBackend: "node",
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -36,6 +38,7 @@ function parseArgs(argv) {
     if (value === "--start-policy") args.startPolicy = argv[++index];
     if (value === "--policy-target-source") args.policyTargetSource = argv[++index];
     if (value === "--shard-compression") args.shardCompression = argv[++index];
+    if (value === "--selfplay-backend") args.selfplayBackend = argv[++index];
   }
   return args;
 }
@@ -48,27 +51,53 @@ function splitGames(totalGames, workers) {
 }
 
 async function runWorker(workerSpec) {
+  const useRustFast = workerSpec.selfplayBackend === "rust-fast";
+  const command = useRustFast ? join(root, "target", "release", "blokus_train_rs") : "node";
+  if (useRustFast) {
+    await access(command, fsConstants.X_OK).catch(() => {
+      throw new Error(`Rust self-play backend is not built: ${command}. Run "pnpm run build:rust" first.`);
+    });
+  }
+  const args = useRustFast
+    ? [
+      "--out",
+      workerSpec.out,
+      "--games",
+      String(workerSpec.games),
+      "--start-policy",
+      workerSpec.startPolicy,
+      "--seed",
+      String(workerSpec.seed),
+      "--teacher-ms",
+      String(workerSpec.teacherMs),
+      "--difficulty",
+      workerSpec.difficulty,
+      "--policy-target-source",
+      workerSpec.policyTargetSource,
+      ...(workerSpec.modelPath ? ["--model-path", workerSpec.modelPath] : []),
+    ]
+    : [
+      join(root, "training", "run_selfplay_worker.mjs"),
+      "--worker-id",
+      workerSpec.workerId,
+      "--out",
+      workerSpec.out,
+      "--games",
+      String(workerSpec.games),
+      "--teacher-ms",
+      String(workerSpec.teacherMs),
+      "--difficulty",
+      workerSpec.difficulty,
+      "--start-policy",
+      workerSpec.startPolicy,
+      "--policy-target-source",
+      workerSpec.policyTargetSource,
+      ...(workerSpec.modelPath ? ["--model-path", workerSpec.modelPath] : []),
+    ];
   await new Promise((resolve, reject) => {
     const child = spawn(
-      "node",
-      [
-        join(root, "training", "run_selfplay_worker.mjs"),
-        "--worker-id",
-        workerSpec.workerId,
-        "--out",
-        workerSpec.out,
-        "--games",
-        String(workerSpec.games),
-        "--teacher-ms",
-        String(workerSpec.teacherMs),
-        "--difficulty",
-        workerSpec.difficulty,
-        "--start-policy",
-        workerSpec.startPolicy,
-        "--policy-target-source",
-        workerSpec.policyTargetSource,
-        ...(workerSpec.modelPath ? ["--model-path", workerSpec.modelPath] : []),
-      ],
+      command,
+      args,
       {
         cwd: root,
         stdio: "inherit",
@@ -89,11 +118,13 @@ export async function runDistributedSelfPlay(config = {}) {
     workerId: `worker-${String(index + 1).padStart(3, "0")}`,
     out: join(config.workerOutputDir, `worker-${String(index + 1).padStart(3, "0")}.jsonl`),
     games,
+    seed: (config.seed ?? 7) + index,
     teacherMs: config.teacherMs ?? 1000,
     difficulty: config.difficulty ?? "master",
     modelPath: config.modelPath ?? null,
     startPolicy: config.startPolicy ?? "fixedStart",
     policyTargetSource: config.policyTargetSource ?? "visit",
+    selfplayBackend: config.selfplayBackend ?? "node",
   }));
 
   await Promise.all(workerSpecs.map(runWorker));
